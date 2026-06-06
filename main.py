@@ -1,14 +1,13 @@
-"""AAH Code Mode 배포 검증용 hello-world agent.
+"""AAH Code Mode 배포 검증용 hello-world agent — AgentCore Runtime 호환.
 
-stdlib만 사용 — 의존성 0, 빌드 빠름. AgentCore Runtime의 표준 패턴
-(POST /invocations + 페이로드)도 지원하므로 향후 진짜 BedrockAgentCoreApp/
-Strands SDK 패턴으로 갈아끼울 때 base로 재활용 가능.
+AgentCore Runtime 컨테이너 계약 (공식):
+  - HTTP server는 port 8080 에 listen
+  - POST /invocations 에서 페이로드 수신 (Content-Type: application/json)
+  - 200 응답 본문은 JSON
+  - GET /ping 또는 / 에서 liveness probe (200 OK)
 
-Endpoints:
-  GET  /                  → health + 서비스 메타
-  GET  /healthz           → liveness probe ("ok")
-  POST /                  → echo + greeting
-  POST /invocations       → BedrockAgentCoreApp 호환 형식 (payload→result)
+stdlib(http.server)만 사용하므로 BedrockAgentCoreApp SDK 없이도 동작.
+나중에 진짜 Strands/BedrockAgentCoreApp 패턴으로 갈아끼울 때 base로 재활용.
 """
 import json
 import os
@@ -24,7 +23,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(body, ensure_ascii=False).encode("utf-8"))
 
-    def _read_payload(self):
+    def _payload(self):
         ln = int(self.headers.get("Content-Length", 0) or 0)
         if not ln:
             return {}
@@ -34,23 +33,28 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):
-        if self.path.startswith("/healthz"):
-            self._respond({"status": "ok"})
+        # AgentCore Runtime의 liveness probe — / 또는 /ping
+        if self.path in ("/ping", "/", "/healthz"):
+            self._respond({"status": "ok",
+                            "service": "aah-code-mode-demo",
+                            "ts": datetime.utcnow().isoformat() + "Z"})
             return
-        self._respond({
-            "service": "aah-code-mode-demo",
-            "status": "ok",
-            "hint": "POST {\"prompt\":\"...\"} to / or /invocations",
-            "ts": datetime.utcnow().isoformat() + "Z",
-        })
+        self._respond({"error": "not found"}, status=404)
 
     def do_POST(self):
-        payload = self._read_payload()
-        prompt = payload.get("prompt") or payload.get("input") or "world"
+        # AgentCore Runtime의 invoke endpoint — /invocations
+        if self.path != "/invocations":
+            self._respond({"error": "expected POST /invocations"}, status=404)
+            return
+        payload = self._payload()
+        prompt = (payload.get("prompt") or
+                    payload.get("input") or
+                    payload.get("message") or "world")
         self._respond({
             "result": f"Hello, {prompt}!",
             "agent": "aah-code-mode-demo",
             "echo": payload,
+            "env_demo": os.environ.get("AAH_DEMO", ""),
             "ts": datetime.utcnow().isoformat() + "Z",
         })
 
@@ -59,7 +63,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8080))   # AgentCore Runtime 표준
     host = "0.0.0.0"
     print(f"[boot] aah-code-mode-demo listening on {host}:{port}", flush=True)
     HTTPServer((host, port), Handler).serve_forever()

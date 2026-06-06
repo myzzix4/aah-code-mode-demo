@@ -1,43 +1,48 @@
 # aah-code-mode-demo
 
 AI Agent Hub의 **Code Mode** 배포 파이프라인 검증용 hello-world agent.
+**AWS Bedrock AgentCore Runtime 컨테이너 계약**을 그대로 따름.
 
-stdlib(`http.server`)만 사용해서 의존성 0. AAH의 CodeBuild → ECR →
-App Runner 사이클이 한 사이클(~6분) 안에 끝나는지 확인하는 데 쓰입니다.
+## AgentCore Runtime 계약
 
-## Endpoints
+| 항목 | 값 |
+|---|---|
+| listen port | `8080` |
+| invoke | `POST /invocations` (JSON in/out) |
+| liveness | `GET /` 또는 `GET /ping` (200 OK) |
 
-| | path | 설명 |
-|---|---|---|
-| GET  | `/`           | health + 서비스 메타 JSON |
-| GET  | `/healthz`    | liveness probe (`{"status":"ok"}`) |
-| POST | `/`           | `{prompt: ...}` → greeting echo |
-| POST | `/invocations`| BedrockAgentCoreApp 호환 (`payload→result`) |
+stdlib(`http.server`)만 사용 — 의존성 0. BedrockAgentCoreApp SDK 박지 않아도
+표준 계약만 지키면 AgentCore Runtime이 호출함.
 
-## AAH 배포 방법
+## AAH 배포
 
-1. AAH `/develop/code-deploy` → "Agent 배포" 클릭
-2. repo URL: `https://github.com/<owner>/aah-code-mode-demo`
-3. branch: `main` / 기본값 그대로 (entry: `python main.py`)
-4. ~6분 대기 → status `ready` → URL 받음
+1. AAH `/develop/code-deploy` → "Agent 배포"
+2. repo URL: `https://github.com/myzzix4/aah-code-mode-demo`
+3. branch: `main`
+4. ~6분 → status `ready` → AgentCore Runtime ARN 발급
 
-## 직접 호출
-
-```bash
-URL=https://<xxx>.us-east-1.awsapprunner.com
-curl $URL/
-curl -X POST $URL/ -H 'Content-Type: application/json' -d '{"prompt":"장호"}'
-```
-
-## 로컬 실행
+## 호출
 
 ```bash
-python main.py        # :8000
-curl http://localhost:8000/
+# AAH 호스트 proxy를 통해
+curl -X POST $AAH_HOST/api/internal/agents/$AGENT_ID/invoke \
+  -H "Content-Type: application/json" \
+  -d '{"input":"장호"}'
+
+# 또는 boto3로 직접
+import boto3
+acc = boto3.client("bedrock-agentcore", region_name="us-east-1")
+acc.invoke_agent_runtime(
+    agentRuntimeArn="arn:aws:bedrock-agentcore:us-east-1:...",
+    payload=json.dumps({"prompt":"장호"}).encode(),
+)
 ```
 
-## 향후 확장
+## 로컬 테스트
 
-이 파일을 base로 `bedrock_agentcore`/`strands` SDK 도입 시 `requirements.txt`에
-추가 + `main.py`의 `do_POST` 안에서 SDK 호출만 변경하면 된다. AAH의 entry.sh가
-같은 패턴(root `main.py` + `requirements.txt`)을 자동 인식.
+```bash
+PORT=8080 python main.py
+curl http://localhost:8080/ping
+curl -X POST http://localhost:8080/invocations \
+  -H "Content-Type: application/json" -d '{"prompt":"장호"}'
+```
