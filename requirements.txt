@@ -1,1 +1,6 @@
-# stdlib only — no third-party deps
+# LangChain + LangGraph + Bedrock — Code Mode 데모 의존성
+langchain>=0.3
+langchain-core>=0.3
+langchain-aws>=0.2
+langgraph>=0.2
+boto3>=1.34

@@ -1,20 +1,70 @@
-"""AAH Code Mode 배포 검증용 hello-world agent — AgentCore Runtime 호환.
+"""AAH Code Mode 데모 — LangChain + LangGraph + Amazon Bedrock.
 
-AgentCore Runtime 컨테이너 계약 (공식):
-  - HTTP server는 port 8080 에 listen
-  - POST /invocations 에서 페이로드 수신 (Content-Type: application/json)
-  - 200 응답 본문은 JSON
-  - GET /ping 또는 / 에서 liveness probe (200 OK)
+LangGraph 그래프:  START → llm → END
+모델:              Claude Haiku 4.5 via Bedrock (us-east-1)
+컨테이너 계약:     AgentCore Runtime — port 8080 + POST /invocations + GET /ping
 
-stdlib(http.server)만 사용하므로 BedrockAgentCoreApp SDK 없이도 동작.
-나중에 진짜 Strands/BedrockAgentCoreApp 패턴으로 갈아끼울 때 base로 재활용.
+핵심:
+  - AgentCore Runtime이 컨테이너의 IAM Role을 통해 자동으로 Bedrock 호출 권한 부여
+  - 별도 AWS 자격증명 환경변수 불필요 (boto3 default chain → role)
+  - 페이로드: {"prompt": "..."} → 응답: {"result": "..."}
+
+Bedrock IAM 정책 필요:
+  bedrock:InvokeModel · bedrock:InvokeModelWithResponseStream
+  on  us.anthropic.claude-haiku-4-5-20251001-v1:0  (cross-region inference profile)
 """
+from __future__ import annotations
+
 import json
 import os
 import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Annotated, TypedDict
 
+from langchain_aws import ChatBedrock
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+
+
+# ─── LangGraph state + node ──────────────────────────────────────────
+
+class State(TypedDict):
+    """Single-message-list state — LangGraph reducer가 새 메시지를 append."""
+    messages: Annotated[list, add_messages]
+
+
+_MODEL_ID = os.environ.get(
+    "MODEL_ID",
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+)
+_REGION = os.environ.get("AWS_REGION", "us-east-1")
+_SYSTEM = (
+    "당신은 AI Agent Hub (AAH)의 Code Mode 데모용 agent다. "
+    "LangChain + LangGraph + Amazon Bedrock 위에서 동작한다는 사실을 답변 시 자연스럽게 한 번 언급한다. "
+    "응답은 한국어로 간결하게."
+)
+
+_llm = ChatBedrock(model_id=_MODEL_ID, region_name=_REGION,
+                     model_kwargs={"max_tokens": 1024, "temperature": 0.3})
+
+
+def llm_node(state: State) -> dict:
+    """그래프의 유일한 노드 — system prompt + 누적된 user 메시지를 LLM에 전달."""
+    msgs = [SystemMessage(content=_SYSTEM)] + list(state["messages"])
+    out = _llm.invoke(msgs)
+    return {"messages": [out]}
+
+
+_g = StateGraph(State)
+_g.add_node("llm", llm_node)
+_g.add_edge(START, "llm")
+_g.add_edge("llm", END)
+_GRAPH = _g.compile()
+
+
+# ─── AgentCore Runtime container contract (HTTP) ─────────────────────
 
 class Handler(BaseHTTPRequestHandler):
     def _respond(self, body, status=200):
@@ -33,39 +83,48 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):
-        # AgentCore Runtime의 liveness probe — / 또는 /ping
         if self.path in ("/ping", "/", "/healthz"):
             self._respond({"status": "ok",
                             "service": "aah-code-mode-demo",
+                            "framework": "langchain+langgraph",
+                            "model": _MODEL_ID,
                             "ts": datetime.utcnow().isoformat() + "Z"})
             return
         self._respond({"error": "not found"}, status=404)
 
     def do_POST(self):
-        # AgentCore Runtime의 invoke endpoint — /invocations
         if self.path != "/invocations":
             self._respond({"error": "expected POST /invocations"}, status=404)
             return
         payload = self._payload()
-        prompt = (payload.get("prompt") or
-                    payload.get("input") or
-                    payload.get("message") or "world")
-        self._respond({
-            "result": f"Hello, {prompt}!",
-            "agent": "aah-code-mode-demo",
-            "echo": payload,
-            "env_demo": os.environ.get("AAH_DEMO", ""),
-            "ts": datetime.utcnow().isoformat() + "Z",
-        })
+        prompt = (payload.get("prompt") or payload.get("input") or
+                    payload.get("message") or "").strip()
+        if not prompt:
+            self._respond({"error": "empty prompt"}, status=400)
+            return
+        try:
+            result = _GRAPH.invoke({"messages": [HumanMessage(content=prompt)]})
+            answer = result["messages"][-1].content
+            self._respond({
+                "result": answer,
+                "agent": "aah-code-mode-demo",
+                "framework": "langgraph",
+                "model": _MODEL_ID,
+                "graph_nodes": ["llm"],
+                "ts": datetime.utcnow().isoformat() + "Z",
+            })
+        except Exception as e:
+            sys.stderr.write(f"[err] {type(e).__name__}: {e}\n")
+            self._respond({"error": str(e)[:500]}, status=500)
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[req] " + (fmt % args) + "\n")
 
 
 def main():
-    port = int(os.environ.get("PORT", 8080))   # AgentCore Runtime 표준
+    port = int(os.environ.get("PORT", 8080))
     host = "0.0.0.0"
-    print(f"[boot] aah-code-mode-demo listening on {host}:{port}", flush=True)
+    print(f"[boot] aah-code-mode-demo on {host}:{port}  model={_MODEL_ID}", flush=True)
     HTTPServer((host, port), Handler).serve_forever()
 
 
